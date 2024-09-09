@@ -1,0 +1,232 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nfs-pv-ruoyi
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteMany
+  nfs:
+    server: 172.29.1.1
+    path: "/exports/ruoyi"
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-pvc-ruoyi
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
+# 数据库
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: database
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: database
+  template:
+    metadata:
+      labels:
+        app: database
+    spec:
+      containers:
+        - name: database
+          image: mysql:8.0
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              value: "123456"
+            - name: MYSQL_DATABASE
+              value: "ry-vue"
+          volumeMounts:
+            - mountPath: /docker-entrypoint-initdb.d
+              name: ruoyi-init-sql
+            - mountPath: /var/lib/mysql
+              name: mysql-storage
+          resources:
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          ports:
+            - containerPort: 3306
+      volumes:
+        - name: ruoyi-init-sql
+          configMap:
+            name: ruoyi-init-sql-config-map
+        - name: mysql-storage
+          persistentVolumeClaim:
+            claimName: nfs-pvc-ruoyi
+      imagePullSecrets:
+        - name: registry-user-pwd-secret
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ruoyi-mysql-service
+  namespace: default
+spec:
+  selector:
+    app: database
+  ports:
+    - port: 3306
+      targetPort: 3306
+
+---
+# redis
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+spec:
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.2.0
+          resources:
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          ports:
+            - containerPort: 6379
+          volumeMounts:
+          - mountPath: /usr/local/etc/redis/redis.conf
+            name: ruoyi-redis-config
+          - mountPath: /var/lib/redis
+            name: redis-storage
+      volumes:
+      - name: ruoyi-redis-config
+        configMap:
+          name: ruoyi-redis-config-map
+      - name: redis-storage
+        persistentVolumeClaim:
+          claimName: nfs-pvc-ruoyi
+      imagePullSecrets:
+        - name: registry-user-pwd-secret
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ruoyi-redis-service
+  namespace: default
+spec:
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+
+# ruoyi 后端
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ruoyi-java
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ruoyi-java
+  template:
+    metadata:
+      labels:
+        app: ruoyi-java
+    spec:
+      initContainers:
+        - name: wait-for-mysql
+          image: mysql:8.0
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              value: "123456"
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              maxTries=10
+              while [ "$$maxTries" -gt 0 ] \
+                    && ! mysqladmin ping --connect-timeout=3 -s \
+                                    -hruoyi-mysql-service -uroot -p$$MYSQL_ROOT_PASSWORD
+              do 
+                  echo 'Waiting for MySQL to be available'
+                  sleep 5
+                  let maxTries--
+              done
+              if [ "$$maxTries" -le 0 ]; then
+                  echo >&2 'error: unable to contact MySQL after 10 tries'
+                  exit 1
+              fi
+        - name: wait-for-redis
+          image: redis:7.2.0
+          env:
+            - name: REDIS_PASSWORD
+              value: "123456"
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              maxTries=10
+              while [ "$$maxTries" -gt 0 ] \
+                    && ! timeout 3 redis-cli -h ruoyi-redis-service -a $$REDIS_PASSWORD ping
+              do 
+                  echo 'Waiting for Redis to be available'
+                  sleep 5
+                  let maxTries--
+              done
+              if [ "$$maxTries" -le 0 ]; then
+                  echo >&2 'error: unable to contact Redis after 10 tries'
+                  exit 1
+              fi
+      containers:
+        - name: ruoyi-java
+          image: 172.29.7.13:5000/ruoyi-backend:1.0
+          resources:
+            limits:
+              memory: "512Mi"
+              cpu: "512m"
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          # /app/ruoyi/ 是 dockerfile 中拷贝 jar 包所到的目录
+          # springboot 启动时，会从 jar 包所在的目录的 config 子目录中查找配置文件
+          volumeMounts:
+            - mountPath: /opt/project/ruoyi/ruoyi-backend/config
+              name: config
+          # 使用 application-k8s.yaml 作为配置文件
+          args:
+            ["java", "-jar", "ruoyi-admin.jar", "--spring.profiles.active=k8s"]
+      volumes:
+        - name: config
+          configMap:
+            name: ruoyi-admin-config
+      imagePullSecrets:
+        - name: registry-user-pwd-secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ruoyi-backend-service
+  namespace: default
+spec:
+  selector:
+    app: ruoyi-java
+  ports:
+    - port: 8080
+      targetPort: 8080
+

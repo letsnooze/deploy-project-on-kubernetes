@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ruoyi-nginx
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ruoyi-nginx
+  template:
+    metadata:
+      labels:
+        app: ruoyi-nginx
+    spec:
+      initContainers:
+        - name: wait-for-ruoyi-backend-service
+          image: alpine
+          command:
+            - sh
+            - -c
+            - |
+              apk add --no-cache curl
+              echo "Starting to wait for ruoyi-backend-service..."
+              until curl -s -f -m 3 http://ruoyi-backend-service:8080
+              do
+                echo "Waiting for ruoyi-backend-service...";
+                sleep 5;
+              done
+              echo "ruoyi-backend-service is available now."
+      containers:
+        - name: ruoyi-nginx
+          image: 172.29.7.13:5000/ruoyi-frontend:1.0
+          resources:
+            limits:
+              memory: "512Mi"
+              cpu: "512m"
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - mountPath: /etc/nginx/conf.d
+              name: config
+      volumes:
+        - name: config
+          configMap:
+            name: ruoyi-ui-config
+            items:
+              - key: nginx.conf
+                path: default.conf
+      imagePullSecrets:
+        - name: registry-user-pwd-secret
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ruoyi-fronted-service
+  namespace: default
+spec:
+  type: NodePort
+  selector:
+    app: ruoyi-nginx
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: 30000
+

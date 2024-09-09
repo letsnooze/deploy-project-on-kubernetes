@@ -1,0 +1,146 @@
+---
+- name: Prepare nodes for Kubernetes cluster
+  hosts: all
+  become: yes
+  tasks:
+    - name: Install chrony for time synchronization
+      apt:
+        name: chrony
+        state: present
+        update_cache: yes
+      notify: restart chronyd
+
+    - name: Configure chrony
+      lineinfile:
+        path: /etc/chrony/chrony.conf
+        line: "pool ntp.aliyun.com iburst maxsources 4"
+        state: present
+
+    - name: Disable swap
+      command: swapoff -a
+
+    - name: Comment out swap in fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^(.*?\\sswap\\s.*)'
+        replace: '# \1'
+        backup: yes
+
+    - name: Disable iptables
+      command: ufw disable
+
+    - name: Ensure Docker repository key is installed
+      apt_key:
+        url: https://mirrors.ustc.edu.cn/docker-ce/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://mirrors.ustc.edu.cn/docker-ce/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+        filename: docker
+
+    - name: Install Docker packages
+      apt:
+        name: [docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin, docker-compose-plugin]
+        state: present
+        update_cache: yes
+
+    - name: Configure Docker daemon
+      copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "exec-opts": ["native.cgroupdriver=systemd"],
+            "insecure-registries" : ["http://172.29.7.13:5000"]
+          }
+        backup: yes
+
+    - name: Install cri-dockerd
+      apt:
+        deb: https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.14.3/cri-dockerd_0.3.14.3-0.ubuntu-jammy_amd64.deb
+        state: present
+
+    - name: Configure cri-dockerd service
+      lineinfile:
+        path: /usr/lib/systemd/system/cri-docker.service
+        regexp: '^(ExecStart=.*)'
+        line: 'ExecStart=/usr/bin/cri-dockerd --container-runtime-endpoint fd:// --network-plugin=cni --cni-bin-dir=/opt/cni/bin --cni-cache-dir=/var/lib/cni/cache --cni-conf-dir=/etc/cni/net.d --pod-infra-container-image=registry.aliyuncs.com/google_containers/pause:3.10'
+        state: present
+      notify: restart cri-dockerd
+
+    - name: Add Kubernetes repository key
+      apt_key:
+        url: https://mirrors.aliyun.com/kubernetes-new/core/stable/v1.31/deb/Release.key
+        state: present
+
+    - name: Add Kubernetes repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://mirrors.aliyun.com/kubernetes-new/core/stable/v1.31/deb/ {{ ansible_distribution_release }} main"
+        state: present
+        filename: kubernetes
+
+    - name: Install Kubernetes packages
+      apt:
+        name: [kubelet, kubeadm, kubectl]
+        state: present
+        update_cache: yes
+
+    - name: Configure kubelet
+      copy:
+        dest: /etc/sysconfig/kubelet
+        content: 'KUBELET_KUBEADM_ARGS="--container-runtime=remote --container-runtime-endpoint=/run/cri-dockerd.sock"'
+        backup: yes
+
+  handlers:
+    - name: restart chronyd
+      systemd:
+        name: chronyd
+        state: restarted
+
+    - name: restart cri-dockerd
+      systemd:
+        name: cri-dockerd
+        state: restarted
+
+- name: Initialize Kubernetes master node
+  hosts: k8s-master01
+  become: yes
+  tasks:
+    - name: Pull Kubernetes images
+      command: kubeadm config images pull --cri-socket unix:///run/cri-dockerd.sock
+
+    - name: Initialize Kubernetes master
+      command: kubeadm init --control-plane-endpoint=172.29.7.1 --apiserver-advertise-address=172.29.7.1 --kubernetes-version=v1.31.0 --pod-network-cidr=10.244.0.0/16 --service-cidr=10.96.0.0/12 --token-ttl=0 --cri-socket unix:///run/cri-dockerd.sock --upload-certs
+      register: init_output
+
+    - name: Create .kube directory
+      file:
+        path: ~/.kube
+        state: directory
+
+    - name: Copy kubeconfig to user home
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: ~/.kube/config
+        remote_src: yes
+        owner: root
+        group: root
+
+    - name: Deploy Flannel pod network
+      command: kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+
+    - name: Wait for pods to be running
+      command: kubectl get pods -n kube-flannel
+      register: pods
+      until: pods.stdout.find("Running") != -1
+      retries: 5
+      delay: 10
+
+- name: Join Kubernetes nodes
+  hosts: k8s-nodes
+  become: yes
+  tasks:
+    - name: Join node to cluster
+      command: kubeadm join 172.29.7.1:6443 --token {{ hostvars['k8s-master01']['init_output.stdout_lines'][0].split(' ')[1] }} --discovery-token-ca-cert-hash sha256:{{ hostvars['k8s-master01']['init_output.stdout_lines'][0].split(' ')[3] }}
+      register: join_output
