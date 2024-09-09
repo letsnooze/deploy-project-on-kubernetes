@@ -1,6 +1,6 @@
 ## 部署 RuoYi 至 Kubernetes 集群
 
-欢迎使用这份全面的指南，它将指导您将 RuoYi 项目部署到 Kubernetes (k8s) 集群中。本仓库提供了一步步的流程，帮助您使用 Kubernetes 设置和管理您的部署。
+本指南将指导您将 RuoYi 项目部署到 Kubernetes (k8s) 集群中。本仓库提供了一步步的流程，帮助您使用 Kubernetes 设置和管理您的部署。
 
 ### 项目概览
 
